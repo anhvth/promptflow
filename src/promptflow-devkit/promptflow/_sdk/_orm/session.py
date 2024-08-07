@@ -67,7 +67,13 @@ def support_transaction(engine):
 
 
 def update_current_schema(engine, orm_class, tablename: str) -> None:
-    sql = f"REPLACE INTO {SCHEMA_INFO_TABLENAME} (tablename, version) VALUES (:tablename, :version);"
+    # sql = f"REPLACE INTO {SCHEMA_INFO_TABLENAME} (tablename, version) VALUES (:tablename, :version);"
+    sql = f"""
+INSERT INTO {SCHEMA_INFO_TABLENAME} (tablename, version)
+VALUES (:tablename, :version)
+ON CONFLICT (tablename)
+DO UPDATE SET version = EXCLUDED.version;
+"""
     with engine.begin() as connection:
         connection.execute(text(sql), {"tablename": tablename, "version": orm_class.__pf_schema_version__})
     return
@@ -86,7 +92,8 @@ def mgmt_db_session() -> Session:
             return session_maker()
         if not LOCAL_MGMT_DB_PATH.parent.is_dir():
             LOCAL_MGMT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        engine = create_engine(f"sqlite:///{str(LOCAL_MGMT_DB_PATH)}?check_same_thread=False", future=True)
+        # engine = create_engine(f"sqlite:///{str(LOCAL_MGMT_DB_PATH)}?check_same_thread=False", future=True)
+        engine = create_engine(f"postgresql+psycopg2://chatgds:1234@node04/prompt_tracing", future=True)
         engine = support_transaction(engine)
 
         from promptflow._sdk._configuration import Configuration
@@ -116,8 +123,8 @@ def mgmt_db_session() -> Session:
 
 
 def build_copy_sql(old_name: str, new_name: str, old_columns: List[str], new_columns: List[str]) -> str:
-    insert_stmt = f"INSERT INTO {new_name}"
-    # append some NULLs for new columns
+    insert_stmt = f"INSERT INTO {new_name} ({', '.join(new_columns)})"
+    # append some NULLs for new columns if needed
     columns = old_columns.copy() + ["NULL"] * (len(new_columns) - len(old_columns))
     select_stmt = "SELECT " + ", ".join(columns) + f" FROM {old_name}"
     sql = f"{insert_stmt} {select_stmt};"
@@ -144,13 +151,16 @@ def get_db_schema_version(engine, tablename: str) -> int:
     try:
         with engine.connect() as connection:
             result = connection.execute(
-                text(f"SELECT version FROM {SCHEMA_INFO_TABLENAME} where tablename=(:tablename)"),
+                text(f"SELECT version FROM {SCHEMA_INFO_TABLENAME} WHERE tablename = :tablename"),
                 {"tablename": tablename},
             ).first()
-            return int(result[0])
+            if result:
+                return int(result[0])
+            else:
+                return 0  # No version found for the table
     except (OperationalError, TypeError):
-        # schema info table not exists(OperationalError) or no version for the table(TypeError)
-        # version fallbacks to 0
+        # Schema info table does not exist (OperationalError) or no version for the table (TypeError)
+        # version falls back to 0
         return 0
 
 
@@ -227,11 +237,25 @@ def create_table_if_not_exists(engine, table_name, orm_class) -> None:
 
 
 def create_index_if_not_exists(engine, index_name, table_name, col_name) -> None:
-    # created_on
-    sql = f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} (f{col_name});"
+    # Construct the SQL query
+    sql = f"""
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relname = '{index_name}'
+            AND n.nspname = 'public'
+        ) THEN
+            CREATE INDEX {index_name} ON {table_name} ({col_name});
+        END IF;
+    END
+    $$;
+    """
+    # Execute the SQL query
     with engine.begin() as connection:
         connection.execute(text(sql))
-    return
 
 
 @contextmanager
@@ -271,7 +295,7 @@ def trace_mgmt_db_session() -> Session:
             return trace_session_maker()
         if not TRACE_MGMT_DB_PATH.parent.is_dir():
             TRACE_MGMT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        engine = create_engine(f"sqlite:///{str(TRACE_MGMT_DB_PATH)}", future=True)
+        engine = create_engine(f"postgresql+psycopg2://chatgds:1234@node04/prompt_tracing", future=True)
         engine = support_transaction(engine)
 
         if any(
